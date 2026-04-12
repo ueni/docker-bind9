@@ -1,6 +1,6 @@
 # BIND - DNS Server
 
-This image will be generated with the newest security updates included.
+This image will be generated with the newest security updates included and hardened.
 
 ## Releasing a new image
 

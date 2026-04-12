@@ -9,35 +9,24 @@ set -e
 # Define default Variables.
 #
 
-USER="named"
+USER="bind"
 GROUP="bind"
 COMMAND_OPTIONS_DEFAULT="-f"
-NAMED_UID_DEFAULT="1000"
-NAMED_GID_DEFAULT="101"
-COMMAND="/usr/sbin/named -u ${USER} -c /etc/bind/named.conf ${COMMAND_OPTIONS:=${COMMAND_OPTIONS_DEFAULT}}"
+COMMAND_OPTIONS="${COMMAND_OPTIONS:-${COMMAND_OPTIONS_DEFAULT}}"
+dirs=( /var/bind /etc/bind /run/named /var/log/named /var/cache/bind )
 
-if [ -z "$(getent group $GROUP)" ]
-then
-    echo "add missing group ${GROUP}"
-    addgroup -gid ${NAMED_GID_DEFAULT} ${GROUP}
-fi
+read -r -a command_options <<< "${COMMAND_OPTIONS}"
+COMMAND=( /usr/sbin/named -u "${USER}" -c /etc/bind/named.conf "${command_options[@]}" )
 
-if [ -z "$(getent passwd $USER)" ]
-then
-    echo "add missing user ${USER}"
-    adduser --system --uid ${NAMED_UID_DEFAULT} --ingroup ${GROUP} ${USER}
-fi
-
-NAMED_UID_ACTUAL=$(id -u ${USER})
-NAMED_GID_ACTUAL=$(id -g ${GROUP})
+mkdir -p /run "${dirs[@]}"
 
 #
 # Display Version
 #
 echo "versions"
 echo "=============="
-echo "  image:           $VERSION"
-echo 
+echo "  image:           ${IMAGE_VERSION:-${VERSION:-}}"
+echo
 
 #
 # Display settings on standard out.
@@ -47,50 +36,19 @@ echo "=============="
 echo
 echo "  Username:        ${USER}"
 echo "  Groupname:       ${GROUP}"
-echo "  UID actual:      ${NAMED_UID_ACTUAL}"
-echo "  GID actual:      ${NAMED_GID_ACTUAL}"
-echo "  UID prefered:    ${NAMED_UID:=${NAMED_UID_DEFAULT}}"
-echo "  GID prefered:    ${NAMED_GID:=${NAMED_GID_DEFAULT}}"
-echo "  Command:         ${COMMAND}"
+echo "  Command:         ${COMMAND[*]}"
 echo
-
-#
-# Change UID / GID of named user.
-#
-echo "Updating UID / GID... "
-if [ ${NAMED_GID_ACTUAL} -ne ${NAMED_GID} -o ${NAMED_UID_ACTUAL} -ne ${NAMED_UID} ]
-then
-    echo "change user / group"
-    deluser ${USER}
-
-    if [ -z "$(getent group $GROUP)" ]
-    then
-        echo "add group ${GROUP}"
-        addgroup -gid ${NAMED_GID} ${GROUP}
-    fi
-
-    adduser --system --uid ${NAMED_UID} --ingroup ${GROUP} ${USER}
-    echo "[DONE]"
-    echo "Set owner and permissions for old uid/gid files"
-    find / -type f -user  ${NAMED_UID_ACTUAL} -not -path "/proc/*" -exec chown ${USER}  {} \;
-    find / -type f -group ${NAMED_GID_ACTUAL} -not -path "/proc/*" -exec chgrp ${GROUP} {} \;
-    echo "[DONE]"
-else
-    echo "[NOTHING DONE]"
-fi
 
 #
 # Set owner and permissions.
 #
 echo "Set owner and permissions... "
-dirs=( /var/bind /etc/bind /var/run/named /var/log/named /var/cache/bind ) 
-mkdir -p                  ${dirs[@]}
-chown -R ${USER}:${GROUP} ${dirs[@]}
-chmod -R o-rwx            ${dirs[@]}
+chown -R "${USER}:${GROUP}" "${dirs[@]}"
+chmod -R o-rwx "${dirs[@]}"
 echo "[DONE]"
 
 #
 # Start named.
 #
 echo "Start named... "
-exec ${COMMAND}
+exec "${COMMAND[@]}"

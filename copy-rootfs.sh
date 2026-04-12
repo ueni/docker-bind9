@@ -184,6 +184,60 @@ fs_to_logical() {
     esac
 }
 
+normalize_logical_path() {
+    local path="$1"
+    local part
+    local last_index
+    local -a parts=()
+
+    require_absolute_logical "$path"
+
+    IFS='/' read -r -a parts <<< "$path"
+    local -a normalized=()
+
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ""|.) ;;
+            ..)
+                if ((${#normalized[@]} > 0)); then
+                    last_index=$((${#normalized[@]} - 1))
+                    unset "normalized[$last_index]"
+                fi
+                ;;
+            *)
+                normalized+=("$part")
+                ;;
+        esac
+    done
+
+    if ((${#normalized[@]} == 0)); then
+        printf '/\n'
+        return 0
+    fi
+
+    printf '/%s\n' "$(IFS=/; printf '%s' "${normalized[*]}")"
+}
+
+logical_symlink_target() {
+    local logical="$1"
+    local srcfs target logical_target
+
+    require_absolute_logical "$logical"
+    srcfs="$(logical_to_fs "$logical")"
+    [[ -L "$srcfs" ]] || return 0
+
+    target="$(readlink -- "$srcfs")"
+    [[ -n "$target" ]] || return 0
+
+    if [[ "$target" == /* ]]; then
+        normalize_logical_path "$target"
+        return 0
+    fi
+
+    logical_target="$(dirname -- "$logical")/$target"
+    normalize_logical_path "$logical_target"
+}
+
 manifest_hash_for_dst() {
     local logical="$1"
     local dstfs="$ROOTFS$logical"
@@ -328,7 +382,7 @@ copy_dir_recursive() {
 
 copy_logical_path() {
     local logical="$1"
-    local srcfs realfs real_logical
+    local srcfs realfs real_logical target_logical
 
     require_absolute_logical "$logical"
     [[ -n "${COPIED_PATHS[$logical]+x}" ]] && return 0
@@ -340,10 +394,16 @@ copy_logical_path() {
 
     if [[ -L "$srcfs" ]]; then
         copy_symlink_logical "$logical"
+        target_logical="$(logical_symlink_target "$logical" || true)"
+        if [[ -n "$target_logical" && "$target_logical" != "$logical" ]]; then
+            copy_logical_path "$target_logical"
+        fi
         realfs="$(readlink -f -- "$srcfs" 2>/dev/null || true)"
         if [[ -n "$realfs" ]]; then
             real_logical="$(fs_to_logical "$realfs")"
-            [[ "$real_logical" != "$logical" ]] && copy_logical_path "$real_logical"
+            if [[ "$real_logical" != "$logical" && "$real_logical" != "$target_logical" ]]; then
+                copy_logical_path "$real_logical"
+            fi
         fi
         return 0
     fi
@@ -681,7 +741,7 @@ collect_search_dirs_for_elf() {
 resolve_needed_for_elf() {
     local elf_logical="$1"
     local soname="$2"
-    local cache_key candidate dir dirfs cand_realfs cand_logical
+    local cache_key candidate dir dirfs candidate_logical
 
     cache_key="$elf_logical|$soname"
     if [[ -n "${RESOLVED_NEEDED_CACHE[$cache_key]+x}" ]]; then
@@ -695,11 +755,10 @@ resolve_needed_for_elf() {
         candidate="$dirfs/$soname"
 
         if [[ -e "$candidate" || -L "$candidate" ]]; then
-            cand_realfs="$(readlink -f -- "$candidate" 2>/dev/null || printf '%s\n' "$candidate")"
-            cand_logical="$(fs_to_logical "$cand_realfs")"
+            candidate_logical="$(fs_to_logical "$candidate")"
 
-            if elf_matches_arch "$elf_logical" "$cand_logical"; then
-                RESOLVED_NEEDED_CACHE["$cache_key"]="$cand_logical"
+            if elf_matches_arch "$elf_logical" "$candidate_logical"; then
+                RESOLVED_NEEDED_CACHE["$cache_key"]="$candidate_logical"
                 printf '%s\n' "${RESOLVED_NEEDED_CACHE[$cache_key]}"
                 return 0
             fi
@@ -716,7 +775,7 @@ can_use_ldd_fast() {
 
 ldd_resolved_logicals() {
     local logical="$1"
-    local srcfs dep real
+    local srcfs dep
 
     can_use_ldd_fast || return 1
     srcfs="$(logical_to_fs "$logical")"
@@ -728,8 +787,7 @@ ldd_resolved_logicals() {
         ' \
         | while IFS= read -r dep; do
             [[ -n "$dep" ]] || continue
-            real="$(readlink -f -- "$dep" 2>/dev/null || printf '%s\n' "$dep")"
-            printf '%s\n' "$(fs_to_logical "$real")"
+            printf '%s\n' "$(fs_to_logical "$dep")"
         done \
         | sort -u
 }
@@ -794,6 +852,13 @@ is_python_interpreter_name() {
     local base
     base="$(basename -- "$logical")"
     [[ "$base" =~ ^python([0-9]+(\.[0-9]+)?)?$ ]]
+}
+
+is_perl_interpreter_name() {
+    local logical="$1"
+    local base
+    base="$(basename -- "$logical")"
+    [[ "$base" =~ ^perl([0-9]+(\.[0-9]+)?)?$ ]]
 }
 
 python_version_from_logical() {
@@ -891,6 +956,51 @@ copy_python_runtime_for() {
     )
 }
 
+perl_inc_paths_host() {
+    local logical="$1"
+    local srcfs
+
+    srcfs="$(logical_to_fs "$logical")"
+    [[ "$SYSROOT" == "/" ]] || return 1
+    [[ -x "$srcfs" ]] || return 1
+
+    "$srcfs" -e '
+        my %seen;
+        for my $path (@INC) {
+            next unless defined $path && length $path;
+            next unless -d $path;
+            next if $seen{$path}++;
+            print "$path\n";
+        }
+    '
+}
+
+copy_perl_runtime_for() {
+    local interp_logical="$1"
+    local p dep_so rel
+    local -A seen=()
+
+    copy_elf_recursive "$interp_logical"
+
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ "$p" == "$SYSROOT"/* ]]; then
+            p="$(fs_to_logical "$p")"
+        fi
+        [[ "$p" == /* ]] || continue
+        [[ -d "$(logical_to_fs "$p")" ]] || continue
+        [[ -n "${seen[$p]+x}" ]] && continue
+        seen["$p"]=1
+
+        copy_logical_path "$p"
+
+        while IFS= read -r dep_so; do
+            rel="${dep_so#$(logical_to_fs "$p")/}"
+            copy_elf_recursive "${p%/}/$rel"
+        done < <(find "$(logical_to_fs "$p")" -type f -name '*.so' -print)
+    done < <(perl_inc_paths_host "$interp_logical" || true)
+}
+
 parse_nss_modules() {
     local nss_logical="$1"
     local srcfs
@@ -917,16 +1027,15 @@ parse_nss_modules() {
 
 resolve_global_library() {
     local soname="$1"
-    local dir dirfs candidate cand_realfs cand_logical
+    local dir dirfs candidate candidate_logical
 
     build_default_lib_dirs
     for dir in "${DEFAULT_LIB_DIRS[@]}"; do
         dirfs="$(logical_to_fs "$dir")"
         candidate="$dirfs/$soname"
         if [[ -e "$candidate" || -L "$candidate" ]]; then
-            cand_realfs="$(readlink -f -- "$candidate" 2>/dev/null || printf '%s\n' "$candidate")"
-            cand_logical="$(fs_to_logical "$cand_realfs")"
-            printf '%s\n' "$cand_logical"
+            candidate_logical="$(fs_to_logical "$candidate")"
+            printf '%s\n' "$candidate_logical"
             return 0
         fi
     done
@@ -936,7 +1045,20 @@ resolve_global_library() {
 copy_nss_runtime() {
     local f mod soname logical
 
-    for f in /etc/nsswitch.conf /etc/hosts /etc/resolv.conf /etc/services /etc/gai.conf; do
+    for f in \
+        /etc/nsswitch.conf \
+        /etc/hosts \
+        /etc/resolv.conf \
+        /etc/services \
+        /etc/gai.conf \
+        /etc/passwd \
+        /etc/group \
+        /etc/shadow \
+        /etc/gshadow \
+        /etc/adduser.conf \
+        /etc/deluser.conf \
+        /etc/login.defs \
+        /etc/default/useradd; do
         [[ -e "$(logical_to_fs "$f")" ]] && copy_logical_path "$f"
     done
 
@@ -1098,6 +1220,8 @@ process_input() {
         copy_elf_recursive "$interp"
         if is_python_interpreter_name "$interp"; then
             register_python_hint "$interp"
+        elif is_perl_interpreter_name "$interp"; then
+            copy_perl_runtime_for "$interp"
         fi
     fi
 }
