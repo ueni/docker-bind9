@@ -18,8 +18,7 @@ RUN apt-get update && \
     apt-get install -y \
         binutils \
         bind9 \
-        bind9-utils \
-        tree 
+        bind9-utils
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY copy-rootfs.sh /usr/local/bin/copy-rootfs.sh
