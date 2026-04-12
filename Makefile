@@ -17,7 +17,7 @@ release: tag
 
 .PHONY: build
 build:
-	docker build -t $(IMAGE) .
+	docker build --progress=plain -t $(IMAGE) .
 
 .PHONY: run
 run: build
