@@ -23,12 +23,15 @@ MANIFEST_FILE=""
 INPUTS=()
 PYTHON_HINT_ARGS=()
 PYTHON_HINTS=()
+PYTHON_MODULE_INPUTS=()
 
 declare -A COPIED_PATHS=()
 declare -A VISITED_ELF=()
 declare -A RESOLVED_NEEDED_CACHE=()
 declare -A DEFAULT_LIB_DIRS_SEEN=()
 declare -A PYTHON_HINTS_SEEN=()
+declare -A PYTHON_MODULES_SEEN=()
+declare -A LD_SO_CONF_SEEN=()
 DEFAULT_LIB_DIRS=()
 
 die() {
@@ -60,16 +63,17 @@ Create a minimal rootfs by copying input executables/scripts/shared libraries
 and their runtime files into an output directory.
 
 Entries may be provided directly and/or with a file list.
-This tool expects trusted inputs. It parses ELF metadata and script shebangs.
+This tool expects trusted inputs. It parses ELF metadata, script shebangs,
+and optionally Python module resolution through a trusted native interpreter.
 Do not use it on untrusted artifacts.
 
 Options:
   -o, --output-dir DIR     Destination rootfs directory (default: /rootfs)
       --sysroot DIR        Source sysroot to read from (default: /)
   -f, --file FILE          Read inputs from FILE, one entry per line
-  -p, --python             Copy Python runtime for detected/specified interpreters
+  -p, --python             Enable Python runtime handling
   -P, --python-bin PATH    Add a Python interpreter to copy runtime for
-      --python-mode MODE   Python tree copy mode: minimal|full (default: minimal)
+      --python-mode MODE   Python copy mode: minimal|full|filter (default: minimal)
   -n, --nss                Copy NSS/runtime name-service files and backend libs
   -s, --ssl                Copy CA bundles / SSL config if present
   -z, --zoneinfo           Copy timezone data
@@ -103,11 +107,24 @@ Entry formats:
   auto:VALUE               Auto-detect input type (default if no prefix is given)
   bin:VALUE                Resolve VALUE as command/binary/script input
   lib:VALUE                Resolve VALUE as shared library input
+  py:VALUE                 Resolve VALUE as Python module/package name
 
 VALUE formats:
   - absolute path, e.g. /usr/bin/curl or /usr/lib/libz.so.1
   - command name, e.g. curl              (for auto:/bin:)
   - SONAME, e.g. libz.so.1               (for lib:)
+  - Python module, e.g. scipy            (for py:)
+
+Python modes:
+  minimal                  Copy discovered Python runtime trees with filters
+  full                     Copy discovered Python runtime trees completely
+  filter                   Copy only selected py: modules/packages plus
+                           baseline stdlib/import machinery
+
+  Notes for filter mode:
+  - requires a native runnable Python interpreter
+  - requires --sysroot /
+  - requires at least one py: entry
 
 Input file format:
   - One entry per line
@@ -128,6 +145,7 @@ Examples:
   copy-rootfs.sh -o /tmp/rootfs -f apps.txt
   copy-rootfs.sh -o /tmp/rootfs --sysroot /mnt/sysroot bin:/usr/bin/bash
   copy-rootfs.sh -o /tmp/rootfs -p -P /usr/bin/python3 /app/my_script.py
+  copy-rootfs.sh -o /tmp/rootfs -p --python-mode filter bin:/usr/bin/python3 py:scipy /bin/cat
 EOF_USAGE
 }
 
@@ -655,9 +673,53 @@ add_default_lib_dir() {
     DEFAULT_LIB_DIRS+=("$logical_dir")
 }
 
+read_ld_so_conf_dirs_file() {
+    local logical_conf="$1"
+    local srcfs canonical_fs canonical_logical line trimmed include_pat include_fs match
+
+    srcfs="$(logical_to_fs "$logical_conf")"
+    [[ -f "$srcfs" ]] || return 0
+
+    canonical_fs="$(readlink -f -- "$srcfs" 2>/dev/null || printf '%s\n' "$srcfs")"
+    canonical_logical="$(fs_to_logical "$canonical_fs")"
+    [[ -n "${LD_SO_CONF_SEEN[$canonical_logical]+x}" ]] && return 0
+    LD_SO_CONF_SEEN["$canonical_logical"]=1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        trimmed="${line%%#*}"
+        trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        [[ -n "$trimmed" ]] || continue
+
+        case "$trimmed" in
+            include*)
+                include_pat="${trimmed#include}"
+                include_pat="${include_pat#"${include_pat%%[![:space:]]*}"}"
+                [[ -n "$include_pat" ]] || continue
+
+                if [[ "$include_pat" == /* ]]; then
+                    include_fs="$(logical_to_fs "$include_pat")"
+                else
+                    include_fs="$(dirname -- "$srcfs")/$include_pat"
+                fi
+
+                for match in $include_fs; do
+                    [[ -f "$match" ]] || continue
+                    read_ld_so_conf_dirs_file "$(fs_to_logical "$(readlink -f -- "$match" 2>/dev/null || printf '%s\n' "$match")")"
+                done
+                ;;
+            /*)
+                add_default_lib_dir "$(normalize_logical_path "$trimmed")"
+                ;;
+        esac
+    done < "$srcfs"
+}
+
 build_default_lib_dirs() {
     local base basefs d dbasefs
     ((${#DEFAULT_LIB_DIRS[@]} == 0)) || return 0
+
+    read_ld_so_conf_dirs_file /etc/ld.so.conf
 
     for base in /lib /lib64 /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64; do
         add_default_lib_dir "$base"
@@ -738,6 +800,25 @@ collect_search_dirs_for_elf() {
     done
 }
 
+ldconfig_cache_candidates() {
+    local soname="$1"
+
+    [[ "$SYSROOT" == "/" ]] || return 1
+    command -v ldconfig >/dev/null 2>&1 || return 1
+
+    LC_ALL=C ldconfig -p 2>/dev/null \
+        | awk -v so="$soname" '
+            $1 == so {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "=>" && (i + 1) <= NF && $(i + 1) ~ /^\//) {
+                        print $(i + 1)
+                    }
+                }
+            }
+        ' \
+        | sort -u
+}
+
 resolve_needed_for_elf() {
     local elf_logical="$1"
     local soname="$2"
@@ -748,6 +829,16 @@ resolve_needed_for_elf() {
         printf '%s\n' "${RESOLVED_NEEDED_CACHE[$cache_key]}"
         return 0
     fi
+
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        candidate_logical="$(fs_to_logical "$candidate")"
+        if elf_matches_arch "$elf_logical" "$candidate_logical"; then
+            RESOLVED_NEEDED_CACHE["$cache_key"]="$candidate_logical"
+            printf '%s\n' "${RESOLVED_NEEDED_CACHE[$cache_key]}"
+            return 0
+        fi
+    done < <(ldconfig_cache_candidates "$soname" || true)
 
     while IFS= read -r dir; do
         [[ -n "$dir" ]] || continue
@@ -847,6 +938,16 @@ register_python_hint() {
     PYTHON_HINTS+=("$logical")
 }
 
+register_python_module() {
+    local module="$1"
+    [[ "$module" == */* ]] && die "py: entries must be Python module names, got path-like value: $module"
+    [[ -n "$module" ]] || die "empty Python module name"
+    [[ -n "${PYTHON_MODULES_SEEN[$module]+x}" ]] && return 0
+    PYTHON_MODULES_SEEN["$module"]=1
+    PYTHON_MODULE_INPUTS+=("$module")
+    COPY_PYTHON=1
+}
+
 is_python_interpreter_name() {
     local logical="$1"
     local base
@@ -880,7 +981,7 @@ python_version_from_logical() {
     return 1
 }
 
-python_sysconfig_paths_host() {
+python_runtime_paths_host() {
     local logical="$1"
     local srcfs
 
@@ -890,23 +991,47 @@ python_sysconfig_paths_host() {
 
     "$srcfs" - <<'PY'
 import os
+import sys
 import sysconfig
+import site
+
 seen = set()
-for key in ("stdlib", "platstdlib", "purelib", "platlib"):
-    p = sysconfig.get_path(key)
+
+def emit(source, p):
     if not p:
-        continue
+        return
     p = os.path.realpath(p)
+    if not os.path.exists(p):
+        return
     if p in seen:
-        continue
+        return
     seen.add(p)
-    print(p)
+    print(f"{source}\t{p}")
+
+for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+    emit(f"sysconfig:{key}", sysconfig.get_path(key))
+
+try:
+    for p in site.getsitepackages():
+        emit("site:getsitepackages", p)
+except Exception:
+    pass
+
+try:
+    emit("site:getusersitepackages", site.getusersitepackages())
+except Exception:
+    pass
+
+for p in sys.path:
+    if p:
+        emit("sys.path", p)
 PY
 }
 
 guess_python_paths() {
     local logical="$1"
     local version=""
+    local major=""
     local realfs reallogical bindir prefix cand
 
     version="$(python_version_from_logical "$logical" || true)"
@@ -916,44 +1041,239 @@ guess_python_paths() {
     prefix="$(dirname -- "$bindir")"
 
     if [[ -n "$version" ]]; then
+        major="${version%%.*}"
         for cand in \
             "$prefix/lib/python$version" \
             "$prefix/lib64/python$version" \
+            "$prefix/lib/python$major/dist-packages" \
+            "$prefix/lib64/python$major/dist-packages" \
+            "$prefix/local/lib/python$major/dist-packages" \
+            "$prefix/local/lib64/python$major/dist-packages" \
             "/usr/lib/python$version" \
             "/usr/lib64/python$version" \
             "/usr/local/lib/python$version" \
-            "/usr/local/lib64/python$version"; do
-            [[ -d "$(logical_to_fs "$cand")" ]] && printf '%s\n' "$cand"
+            "/usr/local/lib64/python$version" \
+            "/usr/lib/python$major/dist-packages" \
+            "/usr/lib64/python$major/dist-packages" \
+            "/usr/local/lib/python$major/dist-packages" \
+            "/usr/local/lib64/python$major/dist-packages"; do
+            [[ -d "$(logical_to_fs "$cand")" ]] && printf 'guess\t%s\n' "$cand"
         done
     fi
 }
 
 copy_python_runtime_for() {
     local interp_logical="$1"
-    local p dep_so rel
+    local source p dep_so rel
     local -A seen=()
 
+    log_debug "python interpreter: $interp_logical"
     copy_elf_recursive "$interp_logical"
 
-    while IFS= read -r p; do
+    while IFS=$'\t' read -r source p; do
         [[ -n "$p" ]] || continue
+
         if [[ "$p" == "$SYSROOT"/* ]]; then
             p="$(fs_to_logical "$p")"
         fi
+
         [[ "$p" == /* ]] || continue
         [[ -d "$(logical_to_fs "$p")" ]] || continue
-        [[ -n "${seen[$p]+x}" ]] && return 0
+        [[ -n "${seen[$p]+x}" ]] && continue
         seen["$p"]=1
 
+        log_debug "python runtime path [$source]: $p"
         copy_tree_with_filter "$p" "$PYTHON_MODE"
 
         while IFS= read -r dep_so; do
             rel="${dep_so#$(logical_to_fs "$p")/}"
+            log_debug "python extension module [$source]: ${p%/}/$rel"
             copy_elf_recursive "${p%/}/$rel"
         done < <(find "$(logical_to_fs "$p")" -type f -name '*.so' -print)
     done < <(
-        python_sysconfig_paths_host "$interp_logical" || guess_python_paths "$interp_logical"
+        python_runtime_paths_host "$interp_logical" || guess_python_paths "$interp_logical"
     )
+}
+
+expand_python_module_names() {
+    local module prefix rest
+    local -A seen=()
+
+    for module in "$@"; do
+        [[ -n "$module" ]] || continue
+
+        prefix=""
+        rest="$module"
+        while [[ -n "$rest" ]]; do
+            if [[ "$rest" == *.* ]]; then
+                if [[ -n "$prefix" ]]; then
+                    prefix+="."
+                fi
+                prefix+="${rest%%.*}"
+                rest="${rest#*.}"
+            else
+                if [[ -n "$prefix" ]]; then
+                    prefix+="."
+                fi
+                prefix+="$rest"
+                rest=""
+            fi
+
+            if [[ -z "${seen[$prefix]+x}" ]]; then
+                seen["$prefix"]=1
+                printf '%s\n' "$prefix"
+            fi
+        done
+    done
+}
+
+python_module_paths_host() {
+    local logical="$1"
+    shift
+    local srcfs
+
+    srcfs="$(logical_to_fs "$logical")"
+    [[ "$SYSROOT" == "/" ]] || return 1
+    [[ -x "$srcfs" ]] || return 1
+    (($# > 0)) || return 1
+
+    "$srcfs" - "$@" <<'PY'
+import importlib.util
+import os
+import sys
+
+seen = set()
+
+def emit(kind, name, path):
+    if not path:
+        return
+    path = os.path.realpath(path)
+    if not os.path.exists(path):
+        return
+    key = (kind, path)
+    if key in seen:
+        return
+    seen.add(key)
+    print(f"{kind}\t{name}\t{path}")
+
+for name in sys.argv[1:]:
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        print(f"error\t{name}\tnot found")
+        continue
+
+    if spec.origin and spec.origin not in ("built-in", "frozen", None):
+        emit("module_file", name, spec.origin)
+
+    if spec.submodule_search_locations:
+        for p in spec.submodule_search_locations:
+            emit("package_dir", name, p)
+PY
+}
+
+copy_python_filter_baseline_for() {
+    local interp_logical="$1"
+    local source p
+    local -A seen=()
+
+    while IFS=$'\t' read -r source p; do
+        [[ -n "$p" ]] || continue
+
+        case "$source" in
+            sysconfig:stdlib|sysconfig:platstdlib) ;;
+            guess)
+                case "$p" in
+                    */python[0-9]*.[0-9]*) ;;
+                    *) continue ;;
+                esac
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        if [[ "$p" == "$SYSROOT"/* ]]; then
+            p="$(fs_to_logical "$p")"
+        fi
+
+        [[ "$p" == /* ]] || continue
+        [[ -d "$(logical_to_fs "$p")" ]] || continue
+        [[ -n "${seen[$p]+x}" ]] && continue
+        seen["$p"]=1
+
+        log_debug "python filter baseline [$source]: $p"
+        copy_tree_with_filter "$p" "minimal"
+    done < <(
+        python_runtime_paths_host "$interp_logical" || guess_python_paths "$interp_logical"
+    )
+}
+
+copy_python_filtered_modules_for() {
+    local interp_logical="$1"
+    shift
+    local kind name p logical rel dep_so
+    local -A seen=()
+    local -a expanded_modules=()
+
+    (($# > 0)) || die "--python-mode filter requires at least one py: entry"
+
+    [[ "$SYSROOT" == "/" ]] || die "--python-mode filter requires --sysroot /"
+
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && expanded_modules+=("$name")
+    done < <(expand_python_module_names "$@")
+
+    log_debug "python interpreter: $interp_logical"
+    copy_elf_recursive "$interp_logical"
+    copy_python_filter_baseline_for "$interp_logical"
+
+    while IFS=$'\t' read -r kind name p; do
+        [[ -n "$kind" ]] || continue
+
+        if [[ "$kind" == "error" ]]; then
+            die "Python module not found: $name"
+        fi
+
+        [[ -n "$p" ]] || continue
+
+        if [[ "$p" == "$SYSROOT"/* ]]; then
+            logical="$(fs_to_logical "$p")"
+        else
+            logical="$p"
+        fi
+
+        [[ "$logical" == /* ]] || continue
+
+        case "$kind" in
+            package_dir)
+                [[ -d "$(logical_to_fs "$logical")" ]] || continue
+                [[ -n "${seen[$logical]+x}" ]] && continue
+                seen["$logical"]=1
+                log_debug "python package dir [$name]: $logical"
+                copy_logical_path "$logical"
+
+                while IFS= read -r dep_so; do
+                    rel="${dep_so#$(logical_to_fs "$logical")/}"
+                    [[ "$rel" != "$dep_so" ]] || continue
+                    log_debug "python package extension [$name]: ${logical%/}/$rel"
+                    copy_elf_recursive "${logical%/}/$rel"
+                done < <(
+                    find "$(logical_to_fs "$logical")" -type f -name '*.so' -print
+                )
+                ;;
+            module_file)
+                [[ -e "$(logical_to_fs "$logical")" || -L "$(logical_to_fs "$logical")" ]] || continue
+                [[ -n "${seen[$logical]+x}" ]] && continue
+                seen["$logical"]=1
+                log_debug "python module file [$name]: $logical"
+                copy_logical_path "$logical"
+
+                if [[ "$logical" == *.so ]]; then
+                    copy_elf_recursive "$logical"
+                fi
+                ;;
+        esac
+    done < <(python_module_paths_host "$interp_logical" "${expanded_modules[@]}")
 }
 
 perl_inc_paths_host() {
@@ -1027,7 +1347,14 @@ parse_nss_modules() {
 
 resolve_global_library() {
     local soname="$1"
-    local dir dirfs candidate candidate_logical
+    local logical dir dirfs candidate candidate_logical
+
+    while IFS= read -r logical; do
+        [[ -n "$logical" ]] || continue
+        [[ "$logical" == /* ]] || continue
+        printf '%s\n' "$logical"
+        return 0
+    done < <(ldconfig_cache_candidates "$soname" || true)
 
     build_default_lib_dirs
     for dir in "${DEFAULT_LIB_DIRS[@]}"; do
@@ -1077,23 +1404,104 @@ copy_nss_runtime() {
     done < <(parse_nss_modules /etc/nsswitch.conf)
 }
 
-copy_runtime_extras() {
-    local f
+openssl_runtime_paths_host() {
+    [[ "$SYSROOT" == "/" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
 
+    LC_ALL=C openssl version -d -m -e 2>/dev/null \
+        | awk -F'"' '
+            /^OPENSSLDIR:/ { print $2 }
+            /^MODULESDIR:/ { print $2 }
+            /^ENGINESDIR:/ { print $2 }
+        ' \
+        | awk 'NF && !seen[$0]++'
+}
+
+openssl_runtime_paths_guess() {
+    local base basefs path logical
+    local -A seen=()
+
+    for logical in /usr/lib/ssl /etc/ssl; do
+        [[ -e "$(logical_to_fs "$logical")" || -L "$(logical_to_fs "$logical")" ]] || continue
+        [[ -n "${seen[$logical]+x}" ]] && continue
+        seen["$logical"]=1
+        printf '%s\n' "$logical"
+    done
+
+    for base in /lib /lib64 /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64; do
+        basefs="$(logical_to_fs "$base")"
+        [[ -d "$basefs" ]] || continue
+
+        for path in \
+            "$basefs"/ossl-modules \
+            "$basefs"/engines-3 \
+            "$basefs"/*/ossl-modules \
+            "$basefs"/*/engines-3; do
+            [[ -e "$path" || -L "$path" ]] || continue
+            logical="$(fs_to_logical "$path")"
+            [[ -n "${seen[$logical]+x}" ]] && continue
+            seen["$logical"]=1
+            printf '%s\n' "$logical"
+        done
+    done
+}
+
+copy_shared_object_tree() {
+    local logical_root="$1"
+    local rootfs_path dep_so rel
+
+    [[ -e "$(logical_to_fs "$logical_root")" || -L "$(logical_to_fs "$logical_root")" ]] || return 0
+
+    copy_logical_path "$logical_root"
+
+    rootfs_path="$(logical_to_fs "$logical_root")"
+    [[ -d "$rootfs_path" ]] || return 0
+
+    while IFS= read -r dep_so; do
+        rel="${dep_so#"$rootfs_path"/}"
+        [[ "$rel" != "$dep_so" ]] || continue
+        copy_elf_recursive "${logical_root%/}/$rel"
+    done < <(
+        find "$rootfs_path" -type f \( -name '*.so' -o -name '*.so.*' \) -print
+    )
+}
+
+copy_ssl_runtime() {
+    local logical
+    local -A seen=()
+
+    for logical in \
+        /etc/ssl/certs \
+        /etc/ssl/openssl.cnf \
+        /etc/ssl/cert.pem \
+        /etc/pki/tls/certs/ca-bundle.crt \
+        /usr/local/share/ca-certificates \
+        /usr/share/ca-certificates \
+        /usr/lib/ssl; do
+        [[ -e "$(logical_to_fs "$logical")" || -L "$(logical_to_fs "$logical")" ]] || continue
+        log_debug "ssl runtime path [static]: $logical"
+        copy_shared_object_tree "$logical"
+    done
+
+    while IFS= read -r logical; do
+        [[ -n "$logical" ]] || continue
+        [[ -e "$(logical_to_fs "$logical")" || -L "$(logical_to_fs "$logical")" ]] || continue
+        [[ -n "${seen[$logical]+x}" ]] && continue
+        seen["$logical"]=1
+        log_debug "ssl runtime path [detected]: $logical"
+        copy_shared_object_tree "$logical"
+    done < <(
+        openssl_runtime_paths_host || openssl_runtime_paths_guess
+    )
+}
+
+copy_runtime_extras() {
     if (( COPY_NSS )); then
         copy_nss_runtime
     fi
 
     if (( COPY_SSL )); then
-        for f in \
-            /etc/ssl/certs \
-            /etc/ssl/openssl.cnf \
-            /etc/pki/tls/certs/ca-bundle.crt \
-            /etc/ssl/cert.pem \
-            /usr/local/share/ca-certificates \
-            /usr/share/ca-certificates; do
-            [[ -e "$(logical_to_fs "$f")" ]] && copy_logical_path "$f"
-        done
+        copy_ssl_runtime
     fi
 
     if (( COPY_ZONEINFO )); then
@@ -1102,30 +1510,28 @@ copy_runtime_extras() {
     fi
 }
 
-resolve_command_input() {
+try_resolve_command_input() {
     local item="$1"
     local resolved=""
     local base
 
     if [[ "$item" == /* ]]; then
-        [[ -e "$(logical_to_fs "$item")" || -L "$(logical_to_fs "$item")" ]] || die "cannot resolve input: $item"
+        [[ -e "$(logical_to_fs "$item")" || -L "$(logical_to_fs "$item")" ]] || return 1
         printf '%s\n' "$item"
         return 0
     fi
 
     if [[ "$item" == */* ]]; then
-        base="$(cd -- "$(dirname -- "$item")" 2>/dev/null && pwd -P)/$(basename -- "$item")"
-        [[ -e "$base" || -L "$base" ]] || die "cannot resolve input: $item"
-        if [[ "$SYSROOT" != "/" ]]; then
-            die "relative path inputs are only supported with --sysroot /: $item"
-        fi
+        [[ "$SYSROOT" == "/" ]] || return 1
+        base="$(cd -- "$(dirname -- "$item")" 2>/dev/null && pwd -P)/$(basename -- "$item")" || return 1
+        [[ -e "$base" || -L "$base" ]] || return 1
         printf '%s\n' "$base"
         return 0
     fi
 
     if [[ "$SYSROOT" == "/" ]]; then
         resolved="$(type -P -- "$item" 2>/dev/null || true)"
-        [[ -n "$resolved" ]] || die "cannot resolve input: $item"
+        [[ -n "$resolved" ]] || return 1
         printf '%s\n' "$resolved"
         return 0
     fi
@@ -1137,32 +1543,52 @@ resolve_command_input() {
         fi
     done
 
-    die "cannot resolve input in sysroot: $item"
+    return 1
 }
 
-resolve_library_input() {
+resolve_command_input() {
+    local item="$1"
+    local resolved
+    resolved="$(try_resolve_command_input "$item" || true)"
+    [[ -n "$resolved" ]] || die "cannot resolve input: $item"
+    printf '%s\n' "$resolved"
+}
+
+try_resolve_library_input() {
     local item="$1"
     local logical=""
 
     if [[ "$item" == /* ]]; then
-        [[ -e "$(logical_to_fs "$item")" || -L "$(logical_to_fs "$item")" ]] || die "cannot resolve library input: $item"
+        [[ -e "$(logical_to_fs "$item")" || -L "$(logical_to_fs "$item")" ]] || return 1
         printf '%s\n' "$item"
         return 0
     fi
 
     if [[ "$item" == */* ]]; then
-        if [[ "$SYSROOT" != "/" ]]; then
-            die "relative library paths are only supported with --sysroot /: $item"
-        fi
-        logical="$(cd -- "$(dirname -- "$item")" 2>/dev/null && pwd -P)/$(basename -- "$item")"
-        [[ -e "$logical" || -L "$logical" ]] || die "cannot resolve library input: $item"
+        [[ "$SYSROOT" == "/" ]] || return 1
+        logical="$(cd -- "$(dirname -- "$item")" 2>/dev/null && pwd -P)/$(basename -- "$item")" || return 1
+        [[ -e "$logical" || -L "$logical" ]] || return 1
         printf '%s\n' "$logical"
         return 0
     fi
 
     logical="$(resolve_global_library "$item" || true)"
-    [[ -n "$logical" ]] || die "cannot resolve library SONAME: $item"
+    [[ -n "$logical" ]] || return 1
     printf '%s\n' "$logical"
+}
+
+resolve_library_input() {
+    local item="$1"
+    local logical=""
+    logical="$(try_resolve_library_input "$item" || true)"
+    [[ -n "$logical" ]] || die "cannot resolve library input: $item"
+    printf '%s\n' "$logical"
+}
+
+is_python_module_candidate() {
+    local item="$1"
+    [[ "$item" != */* ]] || return 1
+    [[ "$item" =~ ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$ ]]
 }
 
 parse_shebang_interpreter() {
@@ -1236,6 +1662,12 @@ process_library_input() {
     copy_elf_recursive "$logical"
 }
 
+process_python_module_input() {
+    local module="$1"
+    [[ "$PYTHON_MODE" == "filter" ]] || die "py: entries require --python-mode filter"
+    register_python_module "$module"
+}
+
 resolve_entry() {
     local entry="$1"
     local kind value logical
@@ -1256,18 +1688,40 @@ resolve_entry() {
             kind="lib"
             value="${entry#lib:}"
             ;;
+        py:*)
+            kind="py"
+            value="${entry#py:}"
+            ;;
     esac
 
     [[ -n "$value" ]] || die "empty entry: $entry"
 
     case "$kind" in
-        auto|bin)
+        auto)
+            if logical="$(try_resolve_command_input "$value" 2>/dev/null)"; then
+                printf 'bin\t%s\n' "$logical"
+                return 0
+            fi
+            if logical="$(try_resolve_library_input "$value" 2>/dev/null)"; then
+                printf 'lib\t%s\n' "$logical"
+                return 0
+            fi
+            if [[ "$PYTHON_MODE" == "filter" ]] && is_python_module_candidate "$value"; then
+                printf 'py\t%s\n' "$value"
+                return 0
+            fi
+            die "cannot auto-resolve entry: $entry"
+            ;;
+        bin)
             logical="$(resolve_command_input "$value")"
-            printf '%s\t%s\n' "$kind" "$logical"
+            printf 'bin\t%s\n' "$logical"
             ;;
         lib)
             logical="$(resolve_library_input "$value")"
-            printf '%s\t%s\n' "$kind" "$logical"
+            printf 'lib\t%s\n' "$logical"
+            ;;
+        py)
+            printf 'py\t%s\n' "$value"
             ;;
         *)
             die "unsupported entry type: $kind"
@@ -1415,8 +1869,8 @@ parse_args() {
     done
 
     case "$PYTHON_MODE" in
-        minimal|full) ;;
-        *) die "invalid --python-mode: $PYTHON_MODE (expected: minimal|full)" ;;
+        minimal|full|filter) ;;
+        *) die "invalid --python-mode: $PYTHON_MODE (expected: minimal|full|filter)" ;;
     esac
 }
 
@@ -1471,11 +1925,14 @@ main() {
         log_info "processing [$kind]: $logical"
 
         case "$kind" in
-            auto|bin)
+            bin)
                 process_input "$logical"
                 ;;
             lib)
                 process_library_input "$logical"
+                ;;
+            py)
+                process_python_module_input "$logical"
                 ;;
             *)
                 die "internal error: unexpected entry kind: $kind"
@@ -1484,10 +1941,22 @@ main() {
     done
 
     if (( COPY_PYTHON )); then
-        ((${#PYTHON_HINTS[@]} > 0)) || die "--python requested but no Python interpreter was detected or specified"
+        ((${#PYTHON_HINTS[@]} > 0)) || die "Python handling requested but no Python interpreter was detected or specified"
+
+        if [[ "$PYTHON_MODE" == "filter" ]]; then
+            ((${#PYTHON_MODULE_INPUTS[@]} > 0)) || die "--python-mode filter requires at least one py: entry"
+        fi
+
         for py in "${PYTHON_HINTS[@]}"; do
             log_info "copying python runtime for: $py"
-            copy_python_runtime_for "$py"
+            case "$PYTHON_MODE" in
+                minimal|full)
+                    copy_python_runtime_for "$py"
+                    ;;
+                filter)
+                    copy_python_filtered_modules_for "$py" "${PYTHON_MODULE_INPUTS[@]}"
+                    ;;
+            esac
         done
     fi
 
