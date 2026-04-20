@@ -11,7 +11,7 @@ set -e
 
 USER="bind"
 GROUP="bind"
-COMMAND_OPTIONS_DEFAULT="-f"
+COMMAND_OPTIONS_DEFAULT="-f $@"
 COMMAND_OPTIONS="${COMMAND_OPTIONS:-${COMMAND_OPTIONS_DEFAULT}}"
 dirs=( /var/bind /etc/bind /run/named /var/log/named /var/cache/bind )
 
